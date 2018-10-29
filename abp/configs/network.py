@@ -21,6 +21,8 @@ default_network_config = {
     "save_network": True,
     "save_steps": 100,
     "learning_rate": 0.001
+    "approx_steps_per_ep": 5,
+    "target_model": "",
 }
 
 
@@ -28,7 +30,8 @@ class NetworkConfig(BaseConfig):
     """ Use this object to configure the network for the adpative """
 
     def __init__(self, config=None):
-        super(NetworkConfig, self).__init__(config=config, default_config=default_network_config)
+        super(NetworkConfig, self).__init__(
+            config=config, default_config=default_network_config)
 
     input_shape = property(BaseConfig.get_property("input_shape"),
                            BaseConfig.set_property("input_shape"))
@@ -68,3 +71,12 @@ class NetworkConfig(BaseConfig):
 
     learning_rate = property(BaseConfig.get_property("learning_rate"),
                              BaseConfig.set_property("learning_rate"))
+
+    approx_steps_per_ep = property(BaseConfig.get_property("approx_steps_per_ep"),
+                                   BaseConfig.set_property("approx_steps_per_ep"))
+
+    approx_steps_per_ep = property(BaseConfig.get_property("approx_steps_per_ep"),
+                                   BaseConfig.set_property("approx_steps_per_ep"))
+
+    target_model = property(BaseConfig.get_property("target_model"),
+                            BaseConfig.set_property("target_model"))
