@@ -78,5 +78,5 @@ class NetworkConfig(BaseConfig):
     approx_steps_per_ep = property(BaseConfig.get_property("approx_steps_per_ep"),
                                    BaseConfig.set_property("approx_steps_per_ep"))
 
-    target_model = property(BaseConfig.get_property("target_model"),
-                            BaseConfig.set_property("target_model"))
+    target_policy = property(BaseConfig.get_property("target_policy"),
+                             BaseConfig.set_property("target_policy"))

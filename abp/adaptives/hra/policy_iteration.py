@@ -1,41 +1,65 @@
-from abp.configs import NetworkConfig
-from abp.models import HRAModel
-from abp.utils import clear_summary_path
+import logging
+import time
+import random
+import pickle
+import os
+import sys
 
+import torch
+from baselines.common.schedules import LinearSchedule
+
+
+from abp.adaptives.common.prioritized_memory.memory import PrioritizedReplayBuffer
+from abp.utils import clear_summary_path
+from abp.models import HRAModel
+from abp.configs import NetworkConfig
 from tensorboardX import SummaryWriter
 
-import numpy as np
-import numpy.random as rand
 
-import logging
 logger = logging.getLogger('root')
+use_cuda = torch.cuda.is_available()
+FloatTensor = torch.cuda.FloatTensor if use_cuda else torch.FloatTensor
+LongTensor = torch.cuda.LongTensor if use_cuda else torch.LongTensor
+IntTensor = torch.cuda.IntTensor if use_cuda else torch.IntTensor
+ByteTensor = torch.cuda.ByteTensor if use_cuda else torch.ByteTensor
+Tensor = FloatTensor
 
 
-class PolicyIter(object):
+class HRAAdaptive(object):
+    """HRAAdaptive using HRA architecture"""
 
     def __init__(self, name, choices, reward_types, network_config, reinforce_config):
-        import sys
-        super(PolicyIter, self).__init__()
-
+        super(HRAAdaptive, self).__init__()
         self.name = name
         self.choices = choices
         self.network_config = network_config
         self.reinforce_config = reinforce_config
         self.replace_frequency = reinforce_config.replace_frequency
-
-        target_model = NetworkConfig.load_from_yaml(
-            network_config.target_model)
-        # Let's not use CUDA, it makes saliency difficult
-        self.target_model = HRAModel(
-            self.name + "_target", target_model, False)
-        self.model = HRAModel(self.name, self.network_config, False)
-
+        self.memory = PrioritizedReplayBuffer(
+            self.reinforce_config.memory_size, 0.6)
         self.learning = True
         self.reward_types = reward_types
         self.steps = 0
         self.episode = 0
         self.reward_history = []
         self.best_reward_mean = -sys.maxsize
+
+        self.beta_schedule = LinearSchedule(self.reinforce_config.beta_timesteps,
+                                            initial_p=self.reinforce_config.beta_initial,
+                                            final_p=self.reinforce_config.beta_final)
+
+        self.approx_steps_per_ep = reinforce_config.approx_steps_per_ep
+
+        self.reset()
+
+        target_model = NetworkConfig.load_from_yaml(
+            network_config.target_policy)
+        self.eval_model = HRAModel(
+            self.name + "_eval", self.network_config, use_cuda)
+        self.target_model = HRAModel(
+            self.name + "_target", self.network_config, use_cuda)
+        self.target_policy = HRAModel(
+            self.name + "_target", target_policy, use_cuda)
 
         reinforce_summary_path = self.reinforce_config.summaries_path + "/" + self.name
 
@@ -46,12 +70,144 @@ class PolicyIter(object):
 
         self.summary = SummaryWriter(log_dir=reinforce_summary_path)
 
+    def __del__(self):
+        self.save()
+        self.summary.close()
+
+    def should_explore(self):
+        return not self.chosen_random and self.random_step == self.ep_steps
+
+    def predict(self, state):
+        self.steps += 1
+
+        if (self.previous_state is not None and
+                self.previous_action is not None):
+            self.memory.add(self.previous_state,
+                            self.previous_action,
+                            self.reward_list(),
+                            state, 0)
+
+        if self.learning and self.should_explore():
+            self.chosen_random = True
+            action = random.choice(list(range(len(self.choices))))
+            q_values = None
+            combined_q_values = None
+            choice = self.choices[action]
+        else:
+            _state = Tensor(state).unsqueeze(0)
+            model_start_time = time.time()
+            action, q_values, combined_q_values = self.eval_model.predict(_state,
+                                                                          self.steps,
+                                                                          self.learning)
+            choice = self.choices[action]
+            self.model_time += time.time() - model_start_time
+
+        self.ep_steps += 1
+
+        if self.learning and self.steps % self.replace_frequency == 0:
+            logger.debug("Replacing target model for %s" % self.name)
+            self.target_model.replace(self.eval_model)
+
+        if (self.learning and
+                self.steps > self.reinforce_config.update_start and
+                self.steps % self.reinforce_config.update_steps == 0):
+
+            update_start_time = time.time()
+            self.update()
+            self.update_time += time.time() - update_start_time
+
+        self.clear_current_rewards()
+
+        self.previous_state = state
+        self.previous_action = action
+
+        return choice, q_values, combined_q_values
+
+    def disable_learning(self):
+        logger.info("Disabled Learning for %s agent" % self.name)
+        self.save()
+
+        self.learning = False
+        self.episode = 0
+
+    def end_episode(self, state):
+        if not self.learning:
+            return
+
+        self.reward_history.append(self.total_reward)
+
+        logger.info("End of Episode %d with total reward %.2f, epsilon %.2f" %
+                    (self.episode + 1, self.total_reward, self.epsilon))
+
+        self.episode += 1
+        self.summary.add_scalar(tag='%s/Episode Reward' % self.name,
+                                scalar_value=self.total_reward,
+                                global_step=self.episode)
+
+        for reward_type in self.reward_types:
+            tag = '%s/Decomposed Reward/%s' % (self.name, reward_type)
+            value = self.decomposed_total_reward[reward_type]
+            self.summary.add_scalar(
+                tag=tag, scalar_value=value, global_step=self.episode)
+
+        self.memory.add(self.previous_state,
+                        self.previous_action,
+                        self.reward_list(),
+                        state, 1)
+
+        self.episode_time = time.time() - self.episode_time
+
+        logger.debug("Episode Time: %.2f, "
+                     "Model prediction time: %.2f, "
+                     "Updated time: %.2f, "
+                     "Update fit time: %.2f" % (self.episode_time,
+                                                self.model_time,
+                                                self.update_time,
+                                                self.fit_time))
+
+        self.save()
+        self.reset()
+
+    def reset(self):
+        self.clear_current_rewards()
+        self.clear_episode_rewards()
+
+        self.previous_state = None
+        self.previous_action = None
+        self.episode_time = time.time()
+        self.update_time = 0
+        self.fit_time = 0
+        self.model_time = 0
+
         self.chosen_random = False
-        self.approx_steps_per_ep = reinforce_config.approx_steps_per_ep
-        self.random_step = rand.randint(self.approx_steps_per_ep)
+        self.random_step = random.randint(0, self.approx_steps_per_ep)
+        self.ep_steps = 0
+
+    def reward_list(self):
+        reward = [0] * len(self.reward_types)
+
+        for i, reward_type in enumerate(sorted(self.reward_types)):
+            reward[i] = self.current_reward[reward_type]
+
+        return reward
+
+    def clear_current_rewards(self):
+        self.current_reward = {}
+        for reward_type in self.reward_types:
+            self.current_reward[reward_type] = 0
+
+    def clear_episode_rewards(self):
+        self.total_reward = 0
+        self.decomposed_total_reward = {}
+        for reward_type in self.reward_types:
+            self.decomposed_total_reward[reward_type] = 0
+
+    def reward(self, reward_type, value):
+        self.current_reward[reward_type] += value
+        self.decomposed_total_reward[reward_type] += value
+        self.total_reward += value
 
     def restore_state(self):
-        import cPickle as pickle
         restore_path = self.network_config.network_path + "/adaptive.info"
 
         if self.network_config.network_path and os.path.exists(restore_path):
@@ -69,7 +225,6 @@ class PolicyIter(object):
                         (self.episode, self.steps, self.best_reward_mean))
 
     def save(self, force=False):
-        import cPickle as pickle
         info = {
             "steps": self.steps,
             "best_reward_mean": self.best_reward_mean,
@@ -78,7 +233,8 @@ class PolicyIter(object):
 
         if force:
             logger.info("Forced to save network")
-            self.model.save_network()
+            self.eval_model.save_network()
+            self.target_model.save_network()
             pickle.dump(info, self.network_config.network_path +
                         "adaptive.info")
 
@@ -94,9 +250,53 @@ class PolicyIter(object):
                 info["best_reward_mean"] = current_reward_mean
                 logger.info(
                     "Saving network. Found new best reward (%.2f)" % current_reward_mean)
-                self.model.save_network()
+                self.eval_model.save_network()
+                self.target_model.save_network()
                 with open(self.network_config.network_path + "/adaptive.info", "wb") as file:
                     pickle.dump(info, file, protocol=pickle.HIGHEST_PROTOCOL)
             else:
                 logger.info("The best reward is still %.2f. Not saving" %
                             current_reward_mean)
+
+    def update(self):
+        if len(self.memory) <= self.reinforce_config.batch_size:
+            return
+
+        beta = self.beta_schedule.value(self.steps)
+        self.summary.add_scalar(tag='%s/Beta' % self.name,
+                                scalar_value=beta, global_step=self.steps)
+
+        batch = self.memory.sample(self.reinforce_config.batch_size, beta)
+
+        (states, actions, reward, next_states,
+         is_terminal, weights, batch_idxes) = batch
+
+        self.summary.add_histogram(tag='%s/Batch Indices' % self.name,
+                                   values=Tensor(batch_idxes),
+                                   global_step=self.steps)
+
+        states = Tensor(states)
+        next_states = Tensor(next_states)
+        terminal = FloatTensor(is_terminal)
+        reward = FloatTensor(reward)
+        batch_index = torch.arange(self.reinforce_config.batch_size,
+                                   dtype=torch.long)
+
+        # Find the target values
+        q_actions, q_values, _ = self.eval_model.predict_batch(states)
+        q_values = q_values[:, batch_index, actions]
+        _, q_next, _ = self.target_model.predict_batch(next_states)
+        q_next = q_next.mean(2).detach()
+        q_next = (1 - terminal) * q_next
+        q_target = reward.t() + self.reinforce_config.discount_factor * q_next
+
+        # Update the model
+        fit_start_time = time.time()
+        self.eval_model.fit(q_values, q_target, self.steps)
+        self.fit_time += time.time() - fit_start_time
+
+        # Update priorities
+        td_errors = q_values - q_target
+        td_errors = torch.sum(td_errors, 0)
+        new_priorities = torch.abs(td_errors) + 1e-6  # prioritized_replay_eps
+        self.memory.update_priorities(batch_idxes, new_priorities.data)

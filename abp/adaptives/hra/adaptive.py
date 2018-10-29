@@ -34,7 +34,8 @@ class HRAAdaptive(object):
         self.network_config = network_config
         self.reinforce_config = reinforce_config
         self.replace_frequency = reinforce_config.replace_frequency
-        self.memory = PrioritizedReplayBuffer(self.reinforce_config.memory_size, 0.6)
+        self.memory = PrioritizedReplayBuffer(
+            self.reinforce_config.memory_size, 0.6)
         self.learning = True
         self.reward_types = reward_types
         self.steps = 0
@@ -52,8 +53,10 @@ class HRAAdaptive(object):
 
         self.reset()
 
-        self.eval_model = HRAModel(self.name + "_eval", self.network_config, use_cuda)
-        self.target_model = HRAModel(self.name + "_target", self.network_config, use_cuda)
+        self.eval_model = HRAModel(
+            self.name + "_eval", self.network_config, use_cuda)
+        self.target_model = HRAModel(
+            self.name + "_target", self.network_config, use_cuda)
 
         reinforce_summary_path = self.reinforce_config.summaries_path + "/" + self.name
 
@@ -143,7 +146,8 @@ class HRAAdaptive(object):
         for reward_type in self.reward_types:
             tag = '%s/Decomposed Reward/%s' % (self.name, reward_type)
             value = self.decomposed_total_reward[reward_type]
-            self.summary.add_scalar(tag=tag, scalar_value=value, global_step=self.episode)
+            self.summary.add_scalar(
+                tag=tag, scalar_value=value, global_step=self.episode)
 
         self.memory.add(self.previous_state,
                         self.previous_action,
@@ -202,7 +206,8 @@ class HRAAdaptive(object):
         restore_path = self.network_config.network_path + "/adaptive.info"
 
         if self.network_config.network_path and os.path.exists(restore_path):
-            logger.info("Restoring state from %s" % self.network_config.network_path)
+            logger.info("Restoring state from %s" %
+                        self.network_config.network_path)
 
             with open(restore_path, "rb") as file:
                 info = pickle.load(file)
@@ -225,24 +230,28 @@ class HRAAdaptive(object):
             logger.info("Forced to save network")
             self.eval_model.save_network()
             self.target_model.save_network()
-            pickle.dump(info, self.network_config.network_path + "adaptive.info")
+            pickle.dump(info, self.network_config.network_path +
+                        "adaptive.info")
 
         if (len(self.reward_history) >= self.network_config.save_steps and
                 self.episode % self.network_config.save_steps == 0):
 
-            total_reward = sum(self.reward_history[-self.network_config.save_steps:])
+            total_reward = sum(
+                self.reward_history[-self.network_config.save_steps:])
             current_reward_mean = total_reward / self.network_config.save_steps
 
-            if True: #current_reward_mean >= self.best_reward_mean:
+            if True:  # current_reward_mean >= self.best_reward_mean:
                 self.best_reward_mean = current_reward_mean
                 info["best_reward_mean"] = current_reward_mean
-                logger.info("Saving network. Found new best reward (%.2f)" % current_reward_mean)
+                logger.info(
+                    "Saving network. Found new best reward (%.2f)" % current_reward_mean)
                 self.eval_model.save_network()
                 self.target_model.save_network()
                 with open(self.network_config.network_path + "/adaptive.info", "wb") as file:
                     pickle.dump(info, file, protocol=pickle.HIGHEST_PROTOCOL)
             else:
-                logger.info("The best reward is still %.2f. Not saving" % current_reward_mean)
+                logger.info("The best reward is still %.2f. Not saving" %
+                            current_reward_mean)
 
     def update(self):
         if len(self.memory) <= self.reinforce_config.batch_size:
